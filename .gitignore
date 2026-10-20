@@ -1,0 +1,7 @@
+# Exclude basic Eclipse files.
+**/.project
+**/.classpath
+**/.settings/
+/unthrottle.exe
+# The log records full command lines of the processes it acts on.
+/unthrottle.log*
