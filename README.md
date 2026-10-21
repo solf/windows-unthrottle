@@ -117,13 +117,14 @@ says so once and the current settings stay in effect.
 | `reset_seconds` | `10` | How long it must stay idle before it is reset. |
 | `log_max_kb` | `1024` | `unthrottle.log` is renamed to `unthrottle.log.1` once it reaches this size. |
 | `other_users` | `false` | `true` also unthrottles other users' and elevated processes; requires [running elevated](#running-elevated). Read at startup only: a change while running is logged and takes effect after a restart. |
+| `on_battery` | `true` | `false` pauses unthrottling while the machine runs on battery: unthrottled processes are reset as soon as it switches to battery (or as soon as you set `false` while on battery), and nothing new is unthrottled until it is back on AC. |
 
 ## Log
 
 `unthrottle.log` is written next to the exe. It records events, not every probe. For example:
 
 ```
-2026-10-20 22:48:13.351 START      pid=15748 user=me processes=java.exe,javaw.exe probe_ms=1000 unthrottle: 2 probes >= 0.8 cores, reset: 10s < 0.2 cores, other_users=off
+2026-10-20 22:48:13.351 START      pid=15748 user=me processes=java.exe,javaw.exe probe_ms=1000 unthrottle: 2 probes >= 0.8 cores, reset: 10s < 0.2 cores, other_users=off, on_battery=on
 2026-10-20 22:48:26.640 UNTHROTTLE java.exe pid=41676: busy (3.0 cores), exempt from background throttling. cmd: "C:\...\java.exe" ... -jar sbt-launch.jar test
 2026-10-20 22:48:40.839 RESET      java.exe pid=41676: idle for 10s, back to Windows' default throttling (unthrottled 14s, peak 3.0 cores)
 ```
@@ -132,7 +133,9 @@ Other per-process lines are `EXIT` (the process ended while unthrottled) and `RE
 "unthrottle stopping" (on `unthrottle.exe stop`). `SKIP` means the process could not be
 changed because it belongs to another user or runs elevated. If Windows rejects a call for any
 other reason, the tag becomes `UNTHROTTLE FAILED` or `RESET FAILED` with the error. After a
-`SKIP` or `UNTHROTTLE FAILED`, that process is not tried again. Windows 10 cannot report a process's
+`SKIP` or `UNTHROTTLE FAILED`, that process is not tried again. With `on_battery=false`, a
+`POWER` line marks each switch between paused and resumed, and every process unthrottled at that
+moment gets a `RESET` line with "on battery". Windows 10 cannot report a process's
 throttling state back, so the log only shows that the call was accepted; to see the effect,
 watch per-core load in Task Manager or Performance Monitor.
 

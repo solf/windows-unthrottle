@@ -38,8 +38,9 @@ sealed class Config
     public double ResetSeconds;
     public long LogMaxBytes;
     public bool OtherUsers;
+    public bool OnBattery;
 
-    static readonly string[] Keys = { "processes", "probe_ms", "unthrottle_cores", "unthrottle_probes", "reset_cores", "reset_seconds", "log_max_kb", "other_users" };
+    static readonly string[] Keys = { "processes", "probe_ms", "unthrottle_cores", "unthrottle_probes", "reset_cores", "reset_seconds", "log_max_kb", "other_users", "on_battery" };
 
     // Parses the whole file or throws InvalidDataException naming the problem; never returns a partial config.
     public static Config Load(string path)
@@ -75,6 +76,7 @@ sealed class Config
         c.ResetSeconds = Number(values, "reset_seconds", 0, int.MaxValue, false, errors);
         c.LogMaxBytes = (long)Number(values, "log_max_kb", 1, int.MaxValue, true, errors) * 1024;
         c.OtherUsers = Flag(values, "other_users", errors);
+        c.OnBattery = Flag(values, "on_battery", errors);
         if (errors.Count > 0) throw new InvalidDataException(string.Join("\n", errors));
         return c;
     }
@@ -110,8 +112,8 @@ sealed class Config
     public override string ToString()
     {
         return string.Format(CultureInfo.InvariantCulture,
-            "processes={0} probe_ms={1} unthrottle: {2} probes >= {3} cores, reset: {4}s < {5} cores, other_users={6}",
-            string.Join(",", Processes), ProbeMs, UnthrottleProbes, UnthrottleCores, ResetSeconds, ResetCores, OtherUsers ? "on" : "off");
+            "processes={0} probe_ms={1} unthrottle: {2} probes >= {3} cores, reset: {4}s < {5} cores, other_users={6}, on_battery={7}",
+            string.Join(",", Processes), ProbeMs, UnthrottleProbes, UnthrottleCores, ResetSeconds, ResetCores, OtherUsers ? "on" : "off", OnBattery ? "on" : "off");
     }
 }
 
@@ -128,6 +130,7 @@ static class Unthrottle
     static Config cfg;
     static DateTime iniStamp;
     static bool iniMissingLogged;
+    static bool paused;   // on battery with on_battery=false: nothing new is unthrottled, unthrottled ones are reset
     static long logMaxBytes = 1024 * 1024;   // only until the ini has been read, so startup errors can be logged
 
     class Tracked
@@ -265,6 +268,16 @@ static class Unthrottle
 
     static void Probe(Dictionary<int, Tracked> tracked)
     {
+        // Re-evaluated every probe, so both unplugging and an on_battery=false edit take effect at once.
+        bool battery = OnBatteryPower();
+        bool pause = battery && !cfg.OnBattery;
+        if (pause != paused)
+        {
+            paused = pause;
+            Log("POWER", pause ? "on battery with on_battery=false: unthrottling paused"
+                : battery ? "on_battery=true: unthrottling resumed on battery" : "on AC: unthrottling resumed");
+        }
+
         var seen = new HashSet<int>();
         foreach (var p in Process.GetProcesses())
         {
@@ -289,6 +302,17 @@ static class Unthrottle
                 double cores = (cpuSec - t.LastCpuSec) / dt;
                 t.LastCpuSec = cpuSec;
                 t.LastAt = now;
+
+                if (paused)
+                {
+                    t.HighProbes = 0;
+                    if (!t.Unthrottled) continue;
+                    LogResult("RESET", SetThrottling(p.Id, false), t, string.Format(CultureInfo.InvariantCulture,
+                        "on battery, back to Windows' default throttling (unthrottled {0:F0}s, peak {1:F1} cores)",
+                        (now - t.UnthrottledAt).TotalSeconds, t.PeakCores));
+                    t.Unthrottled = false;
+                    continue;
+                }
 
                 if (!t.Unthrottled)
                 {
@@ -354,6 +378,22 @@ static class Unthrottle
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool SetProcessInformation(IntPtr h, int infoClass, ref PROCESS_POWER_THROTTLING_STATE info, uint size);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int MessageBox(IntPtr owner, string text, string caption, uint type);
+
+    // --- Win32: AC vs battery. ACLineStatus is 0 offline, 1 online, 255 unknown; unknown counts as AC.
+    [StructLayout(LayoutKind.Sequential)]
+    struct SYSTEM_POWER_STATUS
+    {
+        public byte ACLineStatus, BatteryFlag, BatteryLifePercent, SystemStatusFlag;
+        public uint BatteryLifeTime, BatteryFullLifeTime;
+    }
+
+    [DllImport("kernel32.dll")] static extern bool GetSystemPowerStatus(out SYSTEM_POWER_STATUS status);
+
+    static bool OnBatteryPower()
+    {
+        SYSTEM_POWER_STATUS s;
+        return GetSystemPowerStatus(out s) && s.ACLineStatus == 0;
+    }
 
     // --- Win32: SeDebugPrivilege, which lets an elevated administrator open other users' processes
     [StructLayout(LayoutKind.Sequential)]
