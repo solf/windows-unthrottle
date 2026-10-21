@@ -15,7 +15,8 @@
 // Build: build.bat (C# 5 / .NET Framework 4 csc that ships with Windows).
 // Run:   unthrottle.exe        (no window; one instance per user)
 // Stop:  unthrottle.exe stop   (resets every unthrottled process first)
-// Exit codes: 0 ok, 1 stop: not running, 2 already running, 3 bad config, 4 crash.
+// Exit codes: 0 ok, 1 stop: not running, 2 already running, 3 bad config (including
+// other_users=true without elevation), 4 crash.
 
 using System;
 using System.Collections.Generic;
@@ -36,8 +37,9 @@ sealed class Config
     public double ResetCores;
     public double ResetSeconds;
     public long LogMaxBytes;
+    public bool OtherUsers;
 
-    static readonly string[] Keys = { "processes", "probe_ms", "unthrottle_cores", "unthrottle_probes", "reset_cores", "reset_seconds", "log_max_kb" };
+    static readonly string[] Keys = { "processes", "probe_ms", "unthrottle_cores", "unthrottle_probes", "reset_cores", "reset_seconds", "log_max_kb", "other_users" };
 
     // Parses the whole file or throws InvalidDataException naming the problem; never returns a partial config.
     public static Config Load(string path)
@@ -72,8 +74,18 @@ sealed class Config
         c.ResetCores = Number(values, "reset_cores", 0, 1024, false, errors);
         c.ResetSeconds = Number(values, "reset_seconds", 0, int.MaxValue, false, errors);
         c.LogMaxBytes = (long)Number(values, "log_max_kb", 1, int.MaxValue, true, errors) * 1024;
+        c.OtherUsers = Flag(values, "other_users", errors);
         if (errors.Count > 0) throw new InvalidDataException(string.Join("\n", errors));
         return c;
+    }
+
+    static bool Flag(Dictionary<string, string> values, string key, List<string> errors)
+    {
+        string s;
+        if (!values.TryGetValue(key, out s)) return false;   // already reported as missing
+        if (s.Equals("true", StringComparison.OrdinalIgnoreCase)) return true;
+        if (!s.Equals("false", StringComparison.OrdinalIgnoreCase)) errors.Add(string.Format("{0}: '{1}' is not true or false", key, s));
+        return false;
     }
 
     static double Number(Dictionary<string, string> values, string key, double min, double max, bool integer, List<string> errors)
@@ -98,8 +110,8 @@ sealed class Config
     public override string ToString()
     {
         return string.Format(CultureInfo.InvariantCulture,
-            "processes={0} probe_ms={1} unthrottle: {2} probes >= {3} cores, reset: {4}s < {5} cores",
-            string.Join(",", Processes), ProbeMs, UnthrottleProbes, UnthrottleCores, ResetSeconds, ResetCores);
+            "processes={0} probe_ms={1} unthrottle: {2} probes >= {3} cores, reset: {4}s < {5} cores, other_users={6}",
+            string.Join(",", Processes), ProbeMs, UnthrottleProbes, UnthrottleCores, ResetSeconds, ResetCores, OtherUsers ? "on" : "off");
     }
 }
 
@@ -130,6 +142,7 @@ static class Unthrottle
         public DateTime UnthrottledAt;
         public DateTime BusySince;  // last probe at or above reset_cores while unthrottled
         public double PeakCores;
+        public bool GaveUp;         // a failed unthrottle is not retried for this process
     }
 
     static int Main(string[] args)
@@ -161,6 +174,12 @@ static class Unthrottle
         if (!File.Exists(IniPath)) return ConfigFailure("unthrottle.ini not found.\n\nExpected at: " + IniPath);
         try { Apply(Config.Load(IniPath)); }
         catch (InvalidDataException e) { return ConfigFailure("unthrottle.ini has errors:\n\n" + e.Message + "\n\nFile: " + IniPath); }
+        if (cfg.OtherUsers)
+        {
+            string error = EnableDebugPrivilege();
+            if (error != null)
+                return ConfigFailure("other_users=true needs unthrottle to run elevated (as administrator).\n\n" + error + "\n\nFile: " + IniPath);
+        }
 
         bool firstInstance;
         var mutex = new Mutex(true, MutexName, out firstInstance);
@@ -214,6 +233,7 @@ static class Unthrottle
     }
 
     // A bad edit keeps the previous settings; a deleted ini is reported once and also keeps them.
+    // other_users is read at startup only: the privilege it needs is acquired once, before the mutex.
     static void ReloadIfChanged()
     {
         if (!File.Exists(IniPath))
@@ -227,7 +247,13 @@ static class Unthrottle
         if (stamp == iniStamp) return;
         try
         {
-            Apply(Config.Load(IniPath));
+            Config c = Config.Load(IniPath);
+            if (c.OtherUsers != cfg.OtherUsers)
+            {
+                Log("WARN", "other_users change takes effect after a restart; keeping other_users=" + (cfg.OtherUsers ? "true" : "false"));
+                c.OtherUsers = cfg.OtherUsers;
+            }
+            Apply(c);
             Log("CONFIG", "reloaded " + cfg);
         }
         catch (Exception e)   // InvalidDataException, or the editor still holding the file
@@ -248,7 +274,7 @@ static class Unthrottle
                 if (!cfg.Processes.Contains(name)) continue;
                 double cpuSec; DateTime start;
                 try { cpuSec = p.TotalProcessorTime.TotalSeconds; start = p.StartTime; }
-                catch { continue; }   // another user's process, or it just exited
+                catch { continue; }   // no query access (other users' processes usually still allow it), or it just exited
                 DateTime now = DateTime.UtcNow;
                 seen.Add(p.Id);
 
@@ -266,11 +292,22 @@ static class Unthrottle
 
                 if (!t.Unthrottled)
                 {
+                    if (t.GaveUp) continue;
                     t.HighProbes = cores >= cfg.UnthrottleCores ? t.HighProbes + 1 : 0;
                     if (t.HighProbes < cfg.UnthrottleProbes) continue;
-                    string result = SetThrottling(p.Id, true);
-                    t.Unthrottled = result == "ok";
                     t.HighProbes = 0;
+                    string result = SetThrottling(p.Id, true);
+                    if (result != "ok")
+                    {
+                        // Reading another user's (or an elevated) process's CPU time is allowed, changing it is not.
+                        t.GaveUp = true;
+                        if (result == AccessDenied)
+                            Log("SKIP", name + " pid=" + p.Id + ": no access (another user's or an elevated process), leaving it alone");
+                        else
+                            LogResult("UNTHROTTLE", result + "; not retrying", t, null);
+                        continue;
+                    }
+                    t.Unthrottled = true;
                     t.UnthrottledAt = t.BusySince = now;
                     t.PeakCores = cores;
                     LogResult("UNTHROTTLE", result, t, string.Format(CultureInfo.InvariantCulture,
@@ -318,11 +355,55 @@ static class Unthrottle
     static extern bool SetProcessInformation(IntPtr h, int infoClass, ref PROCESS_POWER_THROTTLING_STATE info, uint size);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int MessageBox(IntPtr owner, string text, string caption, uint type);
 
-    // optOut=true: explicitly not throttled; optOut=false: drop the override, Windows decides again
+    // --- Win32: SeDebugPrivilege, which lets an elevated administrator open other users' processes
+    [StructLayout(LayoutKind.Sequential)]
+    struct LUID { public uint LowPart; public int HighPart; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct TOKEN_PRIVILEGES { public uint PrivilegeCount; public LUID Luid; public uint Attributes; }   // exactly one privilege
+
+    const uint TOKEN_ADJUST_PRIVILEGES = 0x20, TOKEN_QUERY = 0x8, SE_PRIVILEGE_ENABLED = 2;
+    const int ERROR_NOT_ALL_ASSIGNED = 1300;
+
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool LookupPrivilegeValue(string system, string name, out LUID luid);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TOKEN_PRIVILEGES newState, uint bufferLength, IntPtr previousState, IntPtr returnLength);
+
+    // Returns null once the privilege is enabled, else why not. AdjustTokenPrivileges "succeeds" even when
+    // the token lacks the privilege (non-elevated), so ERROR_NOT_ALL_ASSIGNED has to be checked separately.
+    static string EnableDebugPrivilege()
+    {
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out token))
+            return "OpenProcessToken error " + Marshal.GetLastWin32Error();
+        try
+        {
+            LUID luid;
+            if (!LookupPrivilegeValue(null, "SeDebugPrivilege", out luid))
+                return "LookupPrivilegeValue error " + Marshal.GetLastWin32Error();
+            var tp = new TOKEN_PRIVILEGES { PrivilegeCount = 1, Luid = luid, Attributes = SE_PRIVILEGE_ENABLED };
+            if (!AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero))
+                return "AdjustTokenPrivileges error " + Marshal.GetLastWin32Error();
+            return Marshal.GetLastWin32Error() == ERROR_NOT_ALL_ASSIGNED
+                ? "Windows did not grant SeDebugPrivilege: this process is not running elevated." : null;
+        }
+        finally { CloseHandle(token); }
+    }
+
+    const string AccessDenied = "access denied";
+    const int ERROR_ACCESS_DENIED = 5;
+
+    // optOut=true: explicitly not throttled; optOut=false: drop the override, Windows decides again.
+    // Returns "ok", AccessDenied, or a description of the failure.
     static string SetThrottling(int pid, bool optOut)
     {
         IntPtr h = OpenProcess(PROCESS_SET_INFORMATION, false, pid);
-        if (h == IntPtr.Zero) return "OpenProcess error " + Marshal.GetLastWin32Error();
+        if (h == IntPtr.Zero)
+        {
+            int error = Marshal.GetLastWin32Error();
+            return error == ERROR_ACCESS_DENIED ? AccessDenied : "OpenProcess error " + error;
+        }
         try
         {
             var s = new PROCESS_POWER_THROTTLING_STATE { Version = 1, ControlMask = optOut ? THROTTLING_EXECUTION_SPEED : 0, StateMask = 0 };

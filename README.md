@@ -54,7 +54,8 @@ in the foreground gets unthrottled too, which is harmless because it was not bei
   Windows 10 21H2 with an i7-13620H. **Windows 11 has not been tried.** It has the same API
   and a more elaborate scheduler for hybrid CPUs, so the behaviour may differ.
 - .NET Framework 4.x, which is part of Windows 10 and 11.
-- It can only change processes of the user it runs as. Run it as your own user.
+- Normally it can only change processes of the user it runs as, so run it as your own user. To
+  cover other users' processes as well, see [Running elevated](#running-elevated).
 
 ## Build
 
@@ -75,7 +76,21 @@ This compiles `unthrottle.cs` with the C# compiler that ships with .NET Framewor
 
 If `unthrottle.ini` is missing or invalid at startup, or the program crashes, it shows a message
 box with the reason, writes it to `unthrottle.log`, and exits. Exit codes: 0 ok, 1 `stop` found
-nothing running, 2 already running, 3 bad or missing config, 4 crash.
+nothing running, 2 already running, 3 bad or missing config (including `other_users=true`
+without elevation), 4 crash.
+
+### Running elevated
+
+With `other_users=true`, unthrottle also changes other users' processes and elevated ones. For
+that it enables `SeDebugPrivilege`, which Windows grants only to an elevated administrator, so it
+must be started "as administrator". If it is not elevated, it refuses to start with a message box.
+
+- A shortcut in the Startup folder cannot start it elevated without a UAC prompt at every logon.
+  Use Task Scheduler instead: a task triggered "At log on" with "Run with highest privileges".
+- Put the exe in a folder that only administrators can write to, such as
+  `C:\Program Files\unthrottle`. A task that runs elevated from a user-writable folder lets
+  anything running as you (without elevation) replace the exe and get administrator rights at your
+  next logon.
 
 ## Configuration
 
@@ -101,20 +116,23 @@ says so once and the current settings stay in effect.
 | `reset_cores` | `0.2` | CPU load below which an unthrottled process counts as idle. |
 | `reset_seconds` | `10` | How long it must stay idle before it is reset. |
 | `log_max_kb` | `1024` | `unthrottle.log` is renamed to `unthrottle.log.1` once it reaches this size. |
+| `other_users` | `false` | `true` also unthrottles other users' and elevated processes; requires [running elevated](#running-elevated). Read at startup only: a change while running is logged and takes effect after a restart. |
 
 ## Log
 
 `unthrottle.log` is written next to the exe. It records events, not every probe. For example:
 
 ```
-2026-10-20 22:48:13.351 START      pid=15748 user=me processes=java.exe,javaw.exe probe_ms=1000 unthrottle: 2 probes >= 0.8 cores, reset: 10s < 0.2 cores
+2026-10-20 22:48:13.351 START      pid=15748 user=me processes=java.exe,javaw.exe probe_ms=1000 unthrottle: 2 probes >= 0.8 cores, reset: 10s < 0.2 cores, other_users=off
 2026-10-20 22:48:26.640 UNTHROTTLE java.exe pid=41676: busy (3.0 cores), exempt from background throttling. cmd: "C:\...\java.exe" ... -jar sbt-launch.jar test
 2026-10-20 22:48:40.839 RESET      java.exe pid=41676: idle for 10s, back to Windows' default throttling (unthrottled 14s, peak 3.0 cores)
 ```
 
 Other per-process lines are `EXIT` (the process ended while unthrottled) and `RESET` with
-"unthrottle stopping" (on `unthrottle.exe stop`). If Windows rejects a call, the tag becomes
-`UNTHROTTLE FAILED` or `RESET FAILED` with the error. Windows 10 cannot report a process's
+"unthrottle stopping" (on `unthrottle.exe stop`). `SKIP` means the process could not be
+changed because it belongs to another user or runs elevated. If Windows rejects a call for any
+other reason, the tag becomes `UNTHROTTLE FAILED` or `RESET FAILED` with the error. After a
+`SKIP` or `UNTHROTTLE FAILED`, that process is not tried again. Windows 10 cannot report a process's
 throttling state back, so the log only shows that the call was accepted; to see the effect,
 watch per-core load in Task Manager or Performance Monitor.
 
@@ -135,7 +153,9 @@ watch per-core load in Task Manager or Performance Monitor.
   as it stays busy. Keep the `processes` list to things you actually wait on.
 - A process is unthrottled only after `unthrottle_probes` x `probe_ms` of sustained load (about 2 s
   by default), so the first moments of a run are still throttled.
-- Processes of other users are skipped silently.
+- Without `other_users=true` and elevation, it cannot change processes of other users, or elevated
+  (run as administrator) processes. Windows still lets it read their CPU load, so each such process
+  that gets busy is logged once as `SKIP` and then left alone.
 
 ## License
 
